@@ -2,15 +2,19 @@ import base64
 import gc
 import json
 import os
+import html
 import re
 import shlex
 import subprocess
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import ollama
 import torch
 from diffusers import DPMSolverMultistepScheduler, DiffusionPipeline
+from ddgs import DDGS
 
 MODEL = "gemma4:12b"
 # Modelo base SDXL completo: mais lento que Turbo/Lightning, porém com CFG (guidance_scale)
@@ -21,6 +25,8 @@ DIFFUSION_MODEL_ID = os.getenv(
 WORKSPACE = Path.cwd().resolve()
 OUTPUT_DIR = WORKSPACE / "outputs"
 ALLOWLIST_FILE = WORKSPACE / ".agent_allowed_commands.json"
+API_KEY_FILE = WORKSPACE / "ChaveAPI.txt"
+CX_ID_FILE = WORKSPACE / "CX_ID.txt"
 
 DEFAULT_ALLOWED_CMDS = ["ls", "pwd", "cat", "head", "tail", "grep", "find", "wc"]
 
@@ -55,6 +61,21 @@ def _resolve_safe_path(rel_path: str) -> Path:
 def _sanitize_filename(text: str, max_len: int = 40) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip().lower()).strip("_")
     return slug[:max_len] or "desenho"
+
+
+def _load_search_credentials() -> tuple[str, str]:
+    """Carrega API Key e CX ID dos arquivos locais ou variáveis de ambiente."""
+    api_key = os.getenv("GOOGLE_SEARCH_API_KEY", "").strip()
+    cx_id = os.getenv("GOOGLE_SEARCH_CX", "").strip()
+
+    if not api_key and API_KEY_FILE.is_file():
+        api_key = API_KEY_FILE.read_text(encoding="utf-8").strip()
+
+    if not cx_id:
+        if CX_ID_FILE.is_file():
+            cx_id = CX_ID_FILE.read_text(encoding="utf-8").strip()
+
+    return api_key, cx_id
 
 
 def _unload_llm(model_name: str) -> None:
@@ -137,6 +158,61 @@ def ler_imagem(caminho: str) -> str:
         return f"__IMAGE_READY__:{target}"
     except Exception as e:
         return f"Erro ao acessar imagem: {e}"
+
+
+def buscar_web(query: str, num_resultados: int = 5) -> str:
+    """Busca informações na web sem exigir chave de API ou faturamento no Google Cloud."""
+    q = query.strip()
+    if not q:
+        return "Erro: consulta de busca vazia."
+
+    limit = max(1, min(int(num_resultados), 10))
+
+    try:
+        resultados = DDGS().text(q, region="br-pt", max_results=limit)
+        if not resultados:
+            return f"Nenhum resultado encontrado para: '{q}'."
+
+        linhas = [f"Resultados para '{q}':"]
+        for idx, item in enumerate(resultados, start=1):
+            titulo = str(item.get("title", "Sem título")).strip()
+            link = str(item.get("href", "")).strip()
+            trecho = str(item.get("body", "")).replace("\n", " ").strip()
+            linhas.append(f"{idx}. {titulo}\n   URL: {link}\n   Resumo: {trecho}")
+
+        return "\n\n".join(linhas)[:15000]
+    except Exception as e:
+        return f"Erro ao executar busca web: {e}"
+
+def ler_pagina_web(url: str) -> str:
+    """Acessa uma URL (http/https) e extrai o texto visível da página."""
+    if not url.startswith(("http://", "https://")):
+        return "Erro: a URL deve começar com http:// ou https://"
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw_html = resp.read().decode("utf-8", errors="replace")
+
+        # Remove blocos de script e style
+        limpo = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE)
+        # Remove tags HTML e decodifica entidades
+        limpo = re.sub(r"<[^>]+>", " ", limpo)
+        limpo = html.unescape(limpo)
+        # Normaliza espaços e quebras de linha
+        limpo = re.sub(r"\s+", " ", limpo).strip()
+
+        if not limpo:
+            return "Aviso: a página retornou vazia ou exige JavaScript para renderizar o conteúdo."
+
+        return limpo[:6000] + ("\n...[TRUNCADO]..." if len(limpo) > 6000 else "")
+    except Exception as e:
+        return f"Erro ao acessar a página '{url}': {e}"
 
 
 def executar_comando(comando: str) -> str:
@@ -307,8 +383,10 @@ AVAILABLE_TOOLS = {
     "ler_arquivo_texto": ler_arquivo_texto,
     "escrever_arquivo": escrever_arquivo,
     "ler_imagem": ler_imagem,
+    "buscar_web": buscar_web,
     "executar_comando": executar_comando,
     "gerar_imagem": gerar_imagem,
+    "ler_pagina_web": ler_pagina_web,
 }
 
 
@@ -317,14 +395,15 @@ AVAILABLE_TOOLS = {
 # =====================================================================
 
 SYSTEM_PROMPT = f"""Você é um agente de desenvolvimento e automação local operando no diretório: {WORKSPACE}.
-Você tem acesso a ferramentas para listar arquivos, ler textos/códigos, ler imagens, escrever arquivos, executar comandos no terminal e gerar imagens por difusão (gerar_imagem).
+Você tem acesso a ferramentas para listar arquivos, ler textos/códigos, ler imagens, escrever arquivos, buscar informações na web (buscar_web), ler o conteúdo de páginas da web (ler_pagina_web), executar comandos no terminal e gerar imagens por difusão (gerar_imagem).
 Regras:
 1. Sempre inspecione os arquivos antes de fazer suposições sobre o projeto.
 2. Ao escrever arquivos, forneça o conteúdo completo e funcional.
 3. Ao ler uma imagem, identifique o que ela mostra de forma direta e objetiva; não repita análises nem fique em dúvida em loop.
-4. Ao usar gerar_imagem, chame a ferramenta uma vez com um prompt detalhado em inglês descrevendo cena, iluminação, estilo e anatomia explícita (ex: "single character, one head, two arms, two legs").
-5. Se uma ferramenta retornar erro, não fique repetindo a mesma chamada indefinidamente: ajuste uma vez se fizer sentido ou explique o erro ao usuário.
-6. Responda sempre em português de forma clara e objetiva."""
+4. Use buscar_web com palavras-chave curtas e diretas (ex: "clima Campinas") quando precisar de informações externas ou atualizadas. Se os resumos não trouxerem os detalhes necessários, use ler_pagina_web nos links mais relevantes. Evite repetir buscas parecidas se o dado não estiver disponível.
+5. Ao usar gerar_imagem, chame a ferramenta uma vez com um prompt detalhado em inglês descrevendo cena, iluminação, estilo e anatomia explícita (ex: "single character, one head, two arms, two legs").
+6. Se uma ferramenta retornar erro, não fique repetindo a mesma chamada indefinidamente: ajuste uma vez se fizer sentido ou explique o erro ao usuário.
+7. Responda sempre em português de forma clara e objetiva."""
 
 history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
