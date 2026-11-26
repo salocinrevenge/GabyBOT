@@ -1,0 +1,11 @@
+# MEMÓRIA PERMANENTE DO AGENTE (GabyBOT)
+
+## Regras Críticas de Operação
+1. NUNCA sobrescreva `main.py` ou arquivos principais diretamente. Sempre crie uma nova versão incrementando o sufixo numérico (ex: `main_2.py`, `main_3.py`) e compare com a versão anterior para garantir que nenhuma ferramenta ou função original foi perdida.
+2. Evite loops de pensamento e chamadas repetidas de ferramentas. Se uma ação falhar ou truncar, mude a abordagem em vez de repetir exatamente o mesmo passo.
+3. Antes de responder ou modificar o projeto, consulte esta memória e verifique os arquivos existentes no diretório.
+
+## Funcionalidades Implementadas
+- Servidor Web local (Flask) simulando interfaces de chat modernas (estilo Gemini / ChatGPT / Claude).
+- Suporte a envio de texto, colar imagens/textos via Ctrl+V e arrastar/soltar (Drag & Drop) arquivos diretamente no chat.
+- Histórico rolável e streaming em tempo real do pensamento (`[Pensando]`), chamadas de ferramentas (`[Tool]`) e resposta final.

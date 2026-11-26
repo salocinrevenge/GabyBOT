@@ -1,29 +1,33 @@
 import base64
 import gc
+import html
 import json
 import os
-import html
 import re
 import shlex
+import sys
 import subprocess
+import threading
 import urllib.parse
 import urllib.request
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
 import ollama
 import torch
-from diffusers import DPMSolverMultistepScheduler, DiffusionPipeline
 from ddgs import DDGS
+from diffusers import DPMSolverMultistepScheduler, DiffusionPipeline
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 MODEL = "gemma4:12b"
-# Modelo base SDXL completo: mais lento que Turbo/Lightning, porém com CFG (guidance_scale)
-# e mais passos para melhor coerência e detalhes sem exigir modelos de poucos passos.
 DIFFUSION_MODEL_ID = os.getenv(
     "DIFFUSION_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0"
 )
 WORKSPACE = Path.cwd().resolve()
 OUTPUT_DIR = WORKSPACE / "outputs"
+UPLOADS_DIR = WORKSPACE / "uploads"
+MEMORY_FILE = WORKSPACE / "memoria.txt"
 ALLOWLIST_FILE = WORKSPACE / ".agent_allowed_commands.json"
 API_KEY_FILE = WORKSPACE / "ChaveAPI.txt"
 CX_ID_FILE = WORKSPACE / "CX_ID.txt"
@@ -71,9 +75,8 @@ def _load_search_credentials() -> tuple[str, str]:
     if not api_key and API_KEY_FILE.is_file():
         api_key = API_KEY_FILE.read_text(encoding="utf-8").strip()
 
-    if not cx_id:
-        if CX_ID_FILE.is_file():
-            cx_id = CX_ID_FILE.read_text(encoding="utf-8").strip()
+    if not cx_id and CX_ID_FILE.is_file():
+        cx_id = CX_ID_FILE.read_text(encoding="utf-8").strip()
 
     return api_key, cx_id
 
@@ -92,18 +95,38 @@ def _unload_llm(model_name: str) -> None:
 
 
 def _has_thinking_loop(thought: str | None) -> bool:
-    """Detecta se o bloco de raciocínio ficou repetitivo."""
+    """Detecta loops pesados tanto por linhas repetidas quanto por blocos repetitivos."""
     if not thought:
         return False
+    # 1. Checagem de repetição de linhas
     lines = [ln.strip() for ln in thought.splitlines() if ln.strip()]
-    if len(lines) < 8:
-        return False
-    unique_ratio = len(set(lines)) / len(lines)
-    return unique_ratio < 0.35
+    if len(lines) >= 8:
+        unique_ratio = len(set(lines)) / len(lines)
+        if unique_ratio < 0.35:
+            return True
+    # 2. Checagem de frases/blocos repetidos em sequência (previne loop contínuo sem quebra de linha)
+    if len(thought) > 1200:
+        tail = thought[-400:]
+        earlier = thought[:-400]
+        if earlier.count(tail[:120]) >= 3:
+            return True
+    return False
+
+
+def _read_memory() -> str:
+    """Lê o arquivo de memória permanente, criando-o se não existir."""
+    if not MEMORY_FILE.exists():
+        MEMORY_FILE.write_text(
+            "# MEMÓRIA PERMANENTE DO AGENTE\n"
+            "- Regra de Versionamento: Nunca alterar main.py ou arquivos principais diretamente; "
+            "criar main_2.py, main_3.py, etc., e comparar com o original para garantir as funções.\n",
+            encoding="utf-8",
+        )
+    return MEMORY_FILE.read_text(encoding="utf-8", errors="replace")
 
 
 # =====================================================================
-# 1. DEFINIÇÃO DAS FERRAMENTAS DO AGENTE
+# 1. DEFINIÇÃO DAS FERRAMENTAS DO AGENTE (TODAS PRESERVADAS)
 # =====================================================================
 
 
@@ -184,6 +207,7 @@ def buscar_web(query: str, num_resultados: int = 5) -> str:
     except Exception as e:
         return f"Erro ao executar busca web: {e}"
 
+
 def ler_pagina_web(url: str) -> str:
     """Acessa uma URL (http/https) e extrai o texto visível da página."""
     if not url.startswith(("http://", "https://")):
@@ -199,12 +223,11 @@ def ler_pagina_web(url: str) -> str:
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw_html = resp.read().decode("utf-8", errors="replace")
 
-        # Remove blocos de script e style
-        limpo = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE)
-        # Remove tags HTML e decodifica entidades
+        limpo = re.sub(
+            r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE
+        )
         limpo = re.sub(r"<[^>]+>", " ", limpo)
         limpo = html.unescape(limpo)
-        # Normaliza espaços e quebras de linha
         limpo = re.sub(r"\s+", " ", limpo).strip()
 
         if not limpo:
@@ -234,9 +257,7 @@ def executar_comando(comando: str) -> str:
     if not autorizado:
         print(f"\n⚠️  [PERMISSÃO NECESSÁRIA] O agente quer executar:\n   $ {comando}")
         escolha = (
-            input(
-                "Permitir? [s]im / [n]ão / [a]dicionar comando à lista permanente: "
-            )
+            input("Permitir? [s]im / [n]ão / [a]dicionar comando à lista permanente: ")
             .strip()
             .lower()
         )
@@ -309,7 +330,6 @@ def gerar_imagem(
             variant="fp16",
         )
 
-        # Scheduler mais estável para qualidade em ~20-30 passos
         try:
             pipe.scheduler = DPMSolverMultistepScheduler.from_config(
                 pipe.scheduler.config,
@@ -318,8 +338,6 @@ def gerar_imagem(
         except Exception:
             pass
 
-        # Modo padrão: sequential offload reduz picos de RAM em 16 GB (mais lento, mais seguro).
-        # Para priorizar velocidade se tiver RAM sobrando: DIFFUSION_MEM_MODE=gpu
         mem_mode = os.getenv("DIFFUSION_MEM_MODE", "seq_offload").lower()
         if mem_mode == "gpu":
             pipe.to("cuda")
@@ -378,6 +396,24 @@ def gerar_imagem(
         print("🤖 [Memória] Artista desligada; LLM será reativado na próxima chamada.")
 
 
+def iniciar_servidor_web(porta: int = 5000, abrir_navegador: bool = True) -> str:
+    """Inicia o servidor web local de chat em segundo plano com suporte a Ctrl+V, Drag & Drop e histórico."""
+    global _server_started
+    if _server_started:
+        return f"O servidor web já está ativo em http://127.0.0.1:{porta}"
+
+    def _run():
+        app.run(host="127.0.0.1", port=porta, debug=False, use_reloader=False)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    _server_started = True
+    url = f"http://127.0.0.1:{porta}"
+    if abrir_navegador:
+        webbrowser.open(url)
+    return f"Servidor web iniciado com sucesso em {url}"
+
+
 AVAILABLE_TOOLS = {
     "listar_arquivos": listar_arquivos,
     "ler_arquivo_texto": ler_arquivo_texto,
@@ -387,66 +423,112 @@ AVAILABLE_TOOLS = {
     "executar_comando": executar_comando,
     "gerar_imagem": gerar_imagem,
     "ler_pagina_web": ler_pagina_web,
+    "iniciar_servidor_web": iniciar_servidor_web,
 }
 
 
 # =====================================================================
-# 2. LOOP PRINCIPAL DO AGENTE (ReAct)
+# 2. GERENCIAMENTO DE HISTÓRICO E LOOP DO AGENTE (STREAMING + ANTI-LOOP)
 # =====================================================================
 
-SYSTEM_PROMPT = f"""Você é um agente de desenvolvimento e automação local operando no diretório: {WORKSPACE}.
-Você tem acesso a ferramentas para listar arquivos, ler textos/códigos, ler imagens, escrever arquivos, buscar informações na web (buscar_web), ler o conteúdo de páginas da web (ler_pagina_web), executar comandos no terminal e gerar imagens por difusão (gerar_imagem).
+def _build_system_prompt() -> str:
+    memoria_atual = _read_memory()
+    return f"""Você é um agente de desenvolvimento e automação local operando no diretório: {WORKSPACE}.
+Você tem acesso a ferramentas para listar arquivos, ler textos/códigos, ler imagens, escrever arquivos, buscar informações na web (buscar_web), ler páginas web (ler_pagina_web), executar comandos no terminal, gerar imagens (gerar_imagem) e iniciar o servidor web de chat (iniciar_servidor_web).
+
+MEMÓRIA PERMANENTE (leia e respeite sempre):
+{memoria_atual}
+
 Regras:
 1. Sempre inspecione os arquivos antes de fazer suposições sobre o projeto.
-2. Ao escrever arquivos, forneça o conteúdo completo e funcional.
-3. Ao ler uma imagem, identifique o que ela mostra de forma direta e objetiva; não repita análises nem fique em dúvida em loop.
-4. Use buscar_web com palavras-chave curtas e diretas (ex: "clima Campinas") quando precisar de informações externas ou atualizadas. Se os resumos não trouxerem os detalhes necessários, use ler_pagina_web nos links mais relevantes. Evite repetir buscas parecidas se o dado não estiver disponível.
-5. Ao usar gerar_imagem, chame a ferramenta uma vez com um prompt detalhado em inglês descrevendo cena, iluminação, estilo e anatomia explícita (ex: "single character, one head, two arms, two legs").
-6. Se uma ferramenta retornar erro, não fique repetindo a mesma chamada indefinidamente: ajuste uma vez se fizer sentido ou explique o erro ao usuário.
-7. Responda sempre em português de forma clara e objetiva."""
-
-history = [{"role": "system", "content": SYSTEM_PROMPT}]
+2. Nunca sobrescreva `main.py` ou arquivos principais diretamente: crie versões incrementais (`main_2.py`, `main_3.py`, etc.) e compare para garantir integridade.
+3. Ao escrever arquivos grandes, evite repetir tentativas idênticas caso ocorra truncamento.
+4. Responda sempre em português de forma clara e objetiva."""
 
 
-def run_agent_turn(user_prompt: str, max_steps: int = 8) -> None:
-    history.append({"role": "user", "content": user_prompt})
+history = [{"role": "system", "content": _build_system_prompt()}]
+_server_started = False
+
+
+def stream_agent_turn(user_prompt: str, user_images: list[str] | None = None, max_steps: int = 8):
+    """Gerador que executa o turno do agente em streaming, emitindo eventos de pensamento, ferramentas e texto."""
+    # Atualiza o system prompt com a memória mais recente
+    history[0]["content"] = _build_system_prompt()
+
+    user_msg = {"role": "user", "content": user_prompt}
+    if user_images:
+        user_msg["images"] = user_images
+    history.append(user_msg)
+
     use_think = True
 
     for _ in range(max_steps):
-        response = ollama.chat(
-            model=MODEL,
-            messages=history,
-            tools=list(AVAILABLE_TOOLS.values()),
-            think=use_think,
-            options={
-                "num_ctx": 16384,
-                "num_predict": 1536,
-                "temperature": 0.2,
-            },
-        )
+        try:
+            stream = ollama.chat(
+                model=MODEL,
+                messages=history,
+                tools=list(AVAILABLE_TOOLS.values()),
+                think=use_think,
+                stream=True,
+                options={
+                    "num_ctx": 16384,
+                    "num_predict": 4096,  # Mais tokens permitidos para pensamento e resposta
+                    "temperature": 0.2,
+                },
+            )
+        except Exception as e:
+            yield {"type": "error", "content": f"Falha na conexão com Ollama: {e}"}
+            return
 
-        msg = response.message
-        thought = getattr(msg, "thinking", None)
+        full_thought = ""
+        full_content = ""
+        tool_calls = []
+        loop_aborted = False
 
-        if _has_thinking_loop(thought):
-            print("\n⚠️  [Aviso] Loop detectado no raciocínio; tentando próxima etapa sem thinking...\n")
-            use_think = False
+        for chunk in stream:
+            msg = chunk.message
+            t_part = getattr(msg, "thinking", None) or ""
+            c_part = msg.content or ""
+
+            if t_part:
+                full_thought += t_part
+                yield {"type": "thinking", "content": t_part}
+
+                # Prevenção ativa de loops pesados durante o streaming
+                if len(full_thought) > 6000 or _has_thinking_loop(full_thought):
+                    yield {
+                        "type": "thinking",
+                        "content": "\n[⚠️ Pensamento interrompido por limite/repetição; retomando execução...]\n",
+                    }
+                    use_think = False
+                    loop_aborted = True
+                    break
+
+            if c_part:
+                full_content += c_part
+                yield {"type": "content", "content": c_part}
+
+            if msg.tool_calls:
+                tool_calls.extend(msg.tool_calls)
+
+        if loop_aborted:
             continue
 
-        history.append(msg)
+        assistant_record = {"role": "assistant", "content": full_content}
+        if full_thought:
+            assistant_record["thinking"] = full_thought
+        if tool_calls:
+            assistant_record["tool_calls"] = tool_calls
+        history.append(assistant_record)
 
-        if thought:
-            print(f"\n[Pensando]: {thought}\n")
-
-        if not msg.tool_calls:
-            print(f"\nAgente: {msg.content}\n")
+        if not tool_calls:
             break
 
         pending_images = []
-        for tool_call in msg.tool_calls:
+        for tool_call in tool_calls:
             fn_name = tool_call.function.name
             fn_args = tool_call.function.arguments
-            print(f"🔧 [Tool] {fn_name}({fn_args})")
+            yield {"type": "tool", "content": f"{fn_name}({fn_args})"}
 
             func = AVAILABLE_TOOLS.get(fn_name)
             if not func:
@@ -458,7 +540,7 @@ def run_agent_turn(user_prompt: str, max_steps: int = 8) -> None:
                 img_path = Path(result.split(":", 1)[1])
                 img_b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
                 pending_images.append(img_b64)
-                tool_output = f"Imagem '{img_path.name}' carregada com sucesso. Analise a imagem anexada abaixo."
+                tool_output = f"Imagem '{img_path.name}' carregada com sucesso."
             else:
                 tool_output = str(result)
 
@@ -476,10 +558,113 @@ def run_agent_turn(user_prompt: str, max_steps: int = 8) -> None:
             })
 
 
+def run_agent_turn(user_prompt: str, max_steps: int = 8) -> None:
+    """Executa o turno do agente no terminal acompanhando a saída em tempo real."""
+    in_thinking = False
+    in_content = False
+
+    for event in stream_agent_turn(user_prompt, max_steps=max_steps):
+        etype = event["type"]
+        chunk = event["content"]
+
+        if etype == "thinking":
+            if not in_thinking:
+                print("\n[Pensando]: ", end="", flush=True)
+                in_thinking = True
+            print(chunk, end="", flush=True)
+        elif etype == "tool":
+            if in_thinking:
+                print("\n")
+                in_thinking = False
+            print(f"\n🔧 [Tool] {chunk}", flush=True)
+        elif etype == "content":
+            if in_thinking:
+                print("\n")
+                in_thinking = False
+            if not in_content:
+                print("\nAgente: ", end="", flush=True)
+                in_content = True
+            print(chunk, end="", flush=True)
+        elif etype == "error":
+            print(f"\n❌ {chunk}", flush=True)
+
+    print("\n")
+
+
+# =====================================================================
+# 3. SERVIDOR WEB FLASK (ESTILO GEMINI / CHATGPT / CLAUDE)
+# =====================================================================
+
+app = Flask(__name__, template_folder=str(WORKSPACE / "templates"))
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/clear", methods=["POST"])
+def clear_chat():
+    global history
+    history = [{"role": "system", "content": _build_system_prompt()}]
+    return jsonify({"status": "ok"})
+
+
+@app.route("/chat_stream", methods=["POST"])
+def chat_stream():
+    prompt_text = request.form.get("prompt", "").strip()
+    uploaded_files = request.files.getlist("files")
+
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    extracted_texts = []
+    images_b64 = []
+
+    for f in uploaded_files:
+        if not f.filename:
+            continue
+        safe_name = f"{datetime.now().strftime('%H%M%S')}_{Path(f.filename).name}"
+        saved_path = UPLOADS_DIR / safe_name
+        f.save(saved_path)
+
+        ext = saved_path.suffix.lower()
+        if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+            images_b64.append(base64.b64encode(saved_path.read_bytes()).decode("utf-8"))
+            extracted_texts.append(f"[Imagem anexada salva em: uploads/{safe_name}]")
+        else:
+            try:
+                content = saved_path.read_text(encoding="utf-8", errors="replace")
+                extracted_texts.append(
+                    f"--- Conteúdo do arquivo '{f.filename}' (salvo em uploads/{safe_name}) ---\n"
+                    f"{content[:15000]}\n--- Fim do arquivo ---"
+                )
+            except Exception as e:
+                extracted_texts.append(f"[Arquivo binário anexado: uploads/{safe_name} ({e})]")
+
+    full_prompt = prompt_text
+    if extracted_texts:
+        anexos_str = "\n\n".join(extracted_texts)
+        full_prompt = f"{prompt_text}\n\n{anexos_str}".strip()
+
+    if not full_prompt and not images_b64:
+        return jsonify({"error": "Entrada vazia"}), 400
+
+    def generate():
+        for event in stream_agent_turn(full_prompt, user_images=images_b64 or None):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
 def main():
-    print(f"🤖 Agente criativo iniciado em: {WORKSPACE}")
+    if "--web" in sys.argv:
+        print(f"🌐 Iniciando GabyBOT Web em http://127.0.0.1:5000 ...")
+        webbrowser.open("http://127.0.0.1:5000")
+        app.run(host="127.0.0.1", port=5000, debug=False)
+        return
+
+    print(f"🤖 Agente criativo (v2) iniciado em: {WORKSPACE}")
     print(f"📋 Comandos auto-aprovados: {sorted(ALLOWED_COMMANDS)}")
-    print("Digite 'sair' para encerrar.\n")
+    print("💡 Digite 'servidor' para abrir a interface web ou 'sair' para encerrar.\n")
 
     while True:
         try:
@@ -492,6 +677,9 @@ def main():
             continue
         if user_input.lower() in {"sair", "exit", "quit"}:
             break
+        if user_input.lower() == "servidor":
+            print(iniciar_servidor_web())
+            continue
 
         run_agent_turn(user_input)
 
