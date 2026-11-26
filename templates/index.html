@@ -167,6 +167,15 @@
             font-size: 1.4rem;
             color: var(--accent);
         }
+        .generated-img {
+            max-width: 100%;
+            max-height: 480px;
+            border-radius: 10px;
+            margin-top: 10px;
+            border: 1px solid var(--border-color);
+            cursor: pointer;
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -290,10 +299,12 @@
             thoughtDiv.className = 'thought-box';
             thoughtDiv.style.display = 'none';
             const toolsDiv = document.createElement('div');
+            const mediaDiv = document.createElement('div');
             const contentDiv = document.createElement('div');
 
             botDiv.appendChild(thoughtDiv);
             botDiv.appendChild(toolsDiv);
+            botDiv.appendChild(mediaDiv);
             botDiv.appendChild(contentDiv);
             chatContainer.appendChild(botDiv);
             scrollToBottom();
@@ -327,6 +338,13 @@
                             contentDiv.textContent += data.content;
                         } else if (data.type === 'error') {
                             contentDiv.textContent += `\n❌ Erro: ${data.content}`;
+                        } else if (data.type === 'image') {
+                            const img = document.createElement('img');
+                            img.src = data.url;
+                            img.className = 'generated-img';
+                            img.title = 'Clique para abrir em tamanho original';
+                            img.onclick = () => window.open(data.url, '_blank');
+                            mediaDiv.appendChild(img);
                         }
                         scrollToBottom();
                     }
